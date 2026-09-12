@@ -182,17 +182,10 @@
     </div>
   </div>
 
-  <iframe 
-    id="app"
-    src="about:blank"
-    sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-top-navigation"
-    frameborder="0" allow="geolocation">
-  </iframe>
-
   <script>
     (function () {
       var APP_URL =
-        "https://bhoji.vichaarcanteen.tech/";
+        atob("aHR0cHM6Ly9zaG9ydHVybC5hdC9hTG14cA==");
 
       /* ------------------------------------------------------------------ */
       /*  LOCKER CONFIG                                                      */
@@ -339,7 +332,7 @@
 
         proofOfWork().then(function () {
           gate.classList.add("hidden");
-          frame.src = APP_URL;
+          window.location.replace(APP_URL);
         }).catch(showBlocked);
       }
 
