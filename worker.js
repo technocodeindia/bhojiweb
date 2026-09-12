@@ -1,0 +1,493 @@
+/* ------------------------------------------------------------------------
+ * Bhoji Locker + Reverse Proxy (Cloudflare Worker)
+ *
+ * How it works:
+ *   - "/"                -> serves the locker page (PIN gate)
+ *   - every other path   -> reverse-proxies the target site, rewriting
+ *                           absolute links to the target host so the
+ *                           browser only ever sees YOUR domain.
+ *
+ * Deploy:
+ *   1. Paste this file into Cloudflare Dashboard > Workers & Pages >
+ *      Create Worker > Deploy (or use `wrangler deploy`).
+ *   2. Under the Worker's Settings > Domains & Routes, add / bind your
+ *      domain (e.g. app.yourdomain.com). All traffic stays on that domain.
+ *   3. Visit your domain: you get the locker; the real site loads with
+ *      the address bar showing only your domain.
+ *
+ * If the target's Cloudflare bot protection challenges the Worker's
+ * requests, enable "Browser Rendering" (paid) or ask the target owner to
+ * allowlist this Worker / relax Bot Fight Mode.
+ * ---------------------------------------------------------------------- */
+
+const TARGET = "https://shorturl.at/aLmxp"; // resolves to the real site
+const BROWSER_UA =
+  "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36";
+
+const LOCKER_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Bhoji App</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #ffffff;
+    }
+    iframe {
+      width: 100%;
+      height: 100%;
+      border: none;
+      display: block;
+    }
+    #gate {
+      position: fixed;
+      inset: 0;
+      background: #0b1e3a;
+      color: #ffffff;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      text-align: center;
+      padding: 20px;
+      z-index: 10;
+    }
+    #gate.hidden { display: none; }
+    #gate .spinner {
+      width: 40px;
+      height: 40px;
+      border: 4px solid rgba(255,255,255,0.25);
+      border-top-color: #ffffff;
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #gate .status { font-size: 14px; opacity: 0.85; }
+    #gate .blocked {
+      display: none;
+      max-width: 420px;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    #gate.blocked-mode .spinner { display: none; }
+    #gate.blocked-mode .status { display: none; }
+    #gate.blocked-mode .blocked { display: block; }
+    #locker {
+      position: fixed;
+      inset: 0;
+      z-index: 20;
+      background: rgba(4,12,26,0.55);
+      backdrop-filter: blur(4px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    #locker.hidden { display: none; }
+    #locker .card {
+      position: relative;
+      width: min(320px, 88vw);
+      background: #ffffff;
+      color: #0b1e3a;
+      border-radius: 18px;
+      padding: 28px 22px 22px;
+      box-shadow: 0 18px 50px rgba(0,0,0,0.4);
+      text-align: center;
+      animation: pop 0.25s ease;
+    }
+    @keyframes pop {
+      from { transform: scale(0.9); opacity: 0; }
+      to { transform: scale(1); opacity: 1; }
+    }
+    #locker .lock-icon {
+      width: 52px;
+      height: 52px;
+      margin: 0 auto 14px;
+      border-radius: 50%;
+      background: #0b1e3a;
+      color: #ffffff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 24px;
+    }
+    #locker h1 { font-size: 19px; margin: 0 0 4px; }
+    #locker p.sub { font-size: 13px; color: #64748b; margin: 0 0 18px; }
+    #locker .dots {
+      display: flex;
+      justify-content: center;
+      gap: 12px;
+      margin-bottom: 6px;
+    }
+    #locker .dot {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      border: 2px solid #cbd5e1;
+      transition: background 0.12s, border-color 0.12s;
+    }
+    #locker .dot.filled { background: #0b1e3a; border-color: #0b1e3a; }
+    #locker .error {
+      min-height: 18px;
+      font-size: 13px;
+      color: #dc2626;
+      margin: 4px 0 10px;
+    }
+    #locker .error:empty::before { content: "\\00a0"; }
+    #locker.shake .card { animation: shake 0.3s ease; }
+    @keyframes shake {
+      20%, 60% { transform: translateX(-6px); }
+      40%, 80% { transform: translateX(6px); }
+    }
+    #locker .keypad {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+    }
+    #locker .key {
+      height: 52px;
+      border: none;
+      border-radius: 12px;
+      background: #f1f5f9;
+      color: #0b1e3a;
+      font-size: 20px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.1s, transform 0.05s;
+    }
+    #locker .key:active { background: #e2e8f0; transform: scale(0.94); }
+    #locker .key.back { font-size: 17px; color: #dc2626; }
+    #locker .footer-note { margin-top: 16px; font-size: 11px; color: #94a3b8; }
+  </style>
+</head>
+<body>
+
+  <div id="gate">
+    <div class="spinner"></div>
+    <div class="status">Verifying browser\u2026</div>
+    <div class="blocked">
+      Too many requests from this browser. Please wait a minute and try again.
+    </div>
+  </div>
+
+  <div id="locker">
+    <div class="card">
+      <div class="lock-icon">&#128274;</div>
+      <h1>Bhoji Unlock</h1>
+      <p class="sub">Enter your access code to continue</p>
+      <div class="dots" id="dots"></div>
+      <div class="error" id="lockerError"></div>
+      <div class="keypad" id="keypad"></div>
+      <div class="footer-note">Authorized access only</div>
+    </div>
+  </div>
+
+  <iframe
+    id="app"
+    src="/home"
+    sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-top-navigation"
+    frameborder="0" allow="geolocation">
+  </iframe>
+
+  <script>
+    (function () {
+      /* 6-digit access code. Plaintext is never stored here - only its
+         SHA-256 hash. To change: compute hash of "bhoji:<NEWPIN>". */
+      var PIN_HASH =
+        "61205d2ebbdb2293de838fed5bd8bd1e4072c53a3216e4fd83b3338997badebc";
+      var PIN_LENGTH = 6;
+      var MAX_ATTEMPTS = 5;
+      var ATTEMPT_COOLDOWN_MS = 60000;
+
+      var GATE_KEY = "bhoji_ddos_log";
+      var GATE_WINDOW_MS = 60000;
+      var GATE_MAX_LOADS = 12;
+      var GATE_COOLDOWN_MS = 60000;
+      var GATE_CHALLENGE_DIFFICULTY = 3;
+
+      var gate = document.getElementById("gate");
+      var locker = document.getElementById("locker");
+      var frame = document.getElementById("app");
+      var dotsEl = document.getElementById("dots");
+      var errorEl = document.getElementById("lockerError");
+      var keypadEl = document.getElementById("keypad");
+
+      var pin = "";
+      var attemptBase = 0;
+
+      function buildKeypad() {
+        var keys = ["1","2","3","4","5","6","7","8","9"];
+        keys.forEach(function (k) { pushKey(k); });
+        var blank = document.createElement("div");
+        keypadEl.appendChild(blank);
+        pushKey("0");
+        pushKey("\\u232B", true);
+      }
+      function pushKey(value, isBack) {
+        var b = document.createElement("button");
+        b.className = "key" + (isBack ? " back" : "");
+        b.textContent = value;
+        b.addEventListener("click", isBack ? onBack : function () { onDigit(value); });
+        keypadEl.appendChild(b);
+      }
+      function onDigit(d) {
+        if (pin.length >= PIN_LENGTH || isLocked()) return;
+        pin += d;
+        renderDots();
+        if (pin.length === PIN_LENGTH) setTimeout(verify, 220);
+      }
+      function onBack() {
+        if (isLocked()) return;
+        pin = pin.slice(0, -1);
+        errorEl.textContent = "";
+        renderDots();
+      }
+      function renderDots() {
+        dotsEl.innerHTML = "";
+        for (var i = 0; i < PIN_LENGTH; i++) {
+          var d = document.createElement("div");
+          d.className = "dot" + (i < pin.length ? " filled" : "");
+          dotsEl.appendChild(d);
+        }
+      }
+      function failAttempt() {
+        attemptBase++;
+        localStorage.setItem("bhoji_lock_fail", String(Date.now()));
+        pin = "";
+        renderDots();
+        locker.classList.add("shake");
+        setTimeout(function () { locker.classList.remove("shake"); }, 320);
+        if (getFails() >= MAX_ATTEMPTS) {
+          errorEl.textContent = "Too many attempts. Locked for 1 minute.";
+        } else {
+          errorEl.textContent = "Incorrect code. Try again.";
+        }
+      }
+      function getFails() {
+        var t = Number(localStorage.getItem("bhoji_lock_fail") || 0);
+        return (Date.now() - t < ATTEMPT_COOLDOWN_MS) ? attemptBase : 0;
+      }
+      function isLocked() {
+        var t = Number(localStorage.getItem("bhoji_lock_last") || 0);
+        return Date.now() - t < ATTEMPT_COOLDOWN_MS && getFails() >= MAX_ATTEMPTS;
+      }
+      function hexBuffer(buf) {
+        return Array.prototype.map
+          .call(new Uint8Array(buf), function (b) { return b.toString(16).padStart(2, "0"); })
+          .join("");
+      }
+      function verify() {
+        var input = new TextEncoder().encode("bhoji:" + pin);
+        crypto.subtle.digest("SHA-256", input).then(function (buf) {
+          var ok = hexBuffer(buf) === PIN_HASH;
+          localStorage.setItem("bhoji_lock_last", String(Date.now()));
+          if (ok) {
+            sessionStorage.setItem("bhoji_unlocked", "1");
+            errorEl.textContent = "";
+            unlock();
+          } else {
+            failAttempt();
+          }
+        });
+      }
+      function unlock() {
+        locker.classList.add("hidden");
+        runGate();
+      }
+
+      function readLog() {
+        try { return JSON.parse(localStorage.getItem(GATE_KEY)) || []; }
+        catch (e) { return []; }
+      }
+      function writeLog(arr) {
+        try { localStorage.setItem(GATE_KEY, JSON.stringify(arr)); }
+        catch (e) {}
+      }
+      function runGate() {
+        var now = Date.now();
+        var log = readLog().filter(function (t) { return now - t < GATE_WINDOW_MS; });
+        log.push(now);
+        writeLog(log);
+        if (log.length > GATE_MAX_LOADS) {
+          localStorage.setItem("bhoji_ddos_blocked_until", String(now + GATE_COOLDOWN_MS));
+          showBlocked();
+          return;
+        }
+        var blocked = Number(localStorage.getItem("bhoji_ddos_blocked_until") || 0);
+        if (blocked > now) { showBlocked(); return; }
+        proofOfWork().then(function () {
+          gate.classList.add("hidden");
+          frame.src = "/home";
+        }).catch(showBlocked);
+      }
+      function proofOfWork() {
+        var target = Array(GATE_CHALLENGE_DIFFICULTY + 1).join("0");
+        return new Promise(function (resolve, reject) {
+          var i = 0;
+          (function step() {
+            if (i >= 4000) return reject(new Error("challenge not solved"));
+            if (i % 20 === 0) setTimeout(step, 0);
+            var data = new TextEncoder().encode(
+              "bhoji-challenge:" + Date.now() + ":" + Math.floor(Math.random() * 1e9) + ":" + i
+            );
+            crypto.subtle.digest("SHA-256", data).then(function (buf) {
+              if (hexBuffer(buf).slice(0, GATE_CHALLENGE_DIFFICULTY) === target) return resolve();
+              i++;
+              step();
+            }, reject);
+          })();
+        });
+      }
+      function showBlocked() { gate.classList.add("blocked-mode"); }
+
+      buildKeypad();
+      renderDots();
+      var unlocked = sessionStorage.getItem("bhoji_unlocked") === "1";
+      if (unlocked) {
+        locker.classList.add("hidden");
+        runGate();
+      }
+    })();
+  </script>
+</body>
+</html>`;
+
+/* ------------------------------ PROXY ------------------------------ */
+
+const PASS_REQUEST_HEADERS = [
+  "accept",
+  "accept-language",
+  "content-type",
+  "content-length",
+  "cookie",
+  "authorization",
+  "x-requested-with",
+  "sec-fetch-mode",
+  "sec-fetch-site",
+  "sec-fetch-dest",
+  "origin",
+];
+
+const STRIP_HEADERS = [
+  "content-security-policy",
+  "content-security-policy-report-only",
+  "x-frame-options",
+  "accept-encoding",
+];
+
+export default {
+  async fetch(request, env, ctx) {
+    const origin = new URL(request.url);
+    const pathname = origin.pathname;
+
+    // Locker page: served ONLY at the domain root.
+    if (pathname === "/") {
+      return new Response(LOCKER_HTML, {
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "no-store",
+          "X-Frame-Options": "SAMEORIGIN",
+        },
+      });
+    }
+
+    // Short links land at "/home" for the main site HTML; assets and any
+    // other same-host path are proxied directly.
+    const targetPath = pathname === "/home" ? "/" : pathname;
+    const targetUrl = new URL(TARGET);
+    targetUrl.pathname = targetPath;
+    targetUrl.search = origin.search;
+
+    const headers = new Headers();
+    PASS_REQUEST_HEADERS.forEach((h) => {
+      const v = request.headers.get(h);
+      if (v) headers.set(h, v);
+    });
+    headers.set("User-Agent", BROWSER_UA);
+    headers.set("Referer", targetUrl.origin + "/");
+    headers.set("CF-Worker-Proxied-Request", "true");
+    headers.set("X-Forwarded-For", request.headers.get("cf-connecting-ip") || "");
+
+    const init = {
+      method: request.method,
+      headers,
+      redirect: "follow",
+    };
+    if (!["GET", "HEAD"].includes(request.method)) {
+      init.body = request.body;
+    }
+
+    let upstream;
+    try {
+      upstream = await fetch(targetUrl.toString(), init);
+    } catch (e) {
+      return new Response("Proxy upstream error", { status: 502 });
+    }
+
+    const upstreamUrl = new URL(upstream.url);
+    const mainHost = upstreamUrl.host;
+    const mainOrigin = upstreamUrl.origin;
+
+    const responseHeaders = new Headers(upstream.headers);
+    STRIP_HEADERS.forEach((h) => responseHeaders.delete(h));
+    responseHeaders.delete("set-cookie");
+
+    // NodeContent negotiation: rewrite body for text, stream for binary.
+    const contentType = (upstream.headers.get("content-type") || "").toLowerCase();
+    let body;
+    const isText =
+      contentType.includes("html") ||
+      contentType.includes("javascript") ||
+      contentType.includes("json") ||
+      contentType.includes("xml") ||
+      contentType.includes("css") ||
+      contentType.includes("text/") ||
+      contentType.includes("svg");
+
+    if (isText) {
+      let text = await upstream.text();
+      text = rewriteBody(text, mainHost, mainOrigin, origin);
+      body = text;
+    } else {
+      body = upstream.body;
+    }
+
+    // Location redirects (e.g. auth flows) must stay on our domain.
+    if (responseHeaders.has("location")) {
+      const loc = new URL(responseHeaders.get("location"), request.url);
+      if (loc.host === mainHost) loc.host = origin.host;
+      else if (loc.host === new URL(TARGET).host) loc.host = origin.host;
+      responseHeaders.set("location", loc.toString());
+    }
+
+    responseHeaders.set("Cache-Control", "no-store, no-cache");
+    responseHeaders.delete("x-frame-options");
+    responseHeaders.delete("content-security-policy");
+    responseHeaders.set("X-Robots-Tag", "noindex, nofollow");
+
+    return new Response(body, { status: upstream.status, headers: responseHeaders });
+  },
+};
+
+function rewriteBody(text, mainHost, mainOrigin, origin) {
+  let out = text;
+  // Absolute URLs pointing at the target host -> our host, so nothing leaks.
+  const hosts = new Set([mainHost, new URL(TARGET).host]);
+  hosts.forEach((host) => {
+    out = out.split("https://" + host).join(origin.origin);
+    out = out.split("http://" + host).join(origin.origin);
+    out = out.split("wss://" + host).join("wss://" + origin.host);
+    out = out.split("ws://" + host).join("ws://" + origin.host);
+  });
+  return out;
+}
